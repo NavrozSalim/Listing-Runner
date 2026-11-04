@@ -265,6 +265,34 @@ def newest_output(folder: Path, prefix: str, since: float) -> Path | None:
     return max(found, key=lambda p: p.stat().st_mtime) if found else None
 
 
+def _log_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_tail(path: Path, start: int = 0) -> list[str]:
+    try:
+        with path.open('rb') as fh:
+            fh.seek(start)
+            text = fh.read().decode('utf-8', errors='replace')
+    except OSError:
+        return []
+    # Selenium dumps long "(No symbol)" stack frames; they never help on the page.
+    return [line.rstrip() for line in text.splitlines() if line.strip() and '(No symbol)' not in line]
+
+
+def bot_error_text(log_path: Path, log_start: int, err_path: Path, limit: int = 1400) -> str:
+    """Why the bot failed, for the job note: its error output plus this run's error and FAIL log lines."""
+    errors = _read_tail(err_path)[-12:]
+    logged = _read_tail(log_path, log_start)
+    picked = [line for line in logged if re.search(r'\[(ERROR|CRITICAL|WARNING)\]|\bFAIL\b|Traceback', line)]
+    lines = errors + (picked or logged)[-12:]
+    text = '\n'.join(lines).strip()
+    return text[-limit:] if text else ''
+
+
 def _safe_name(name: str) -> str:
     clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', Path(name or 'input.xlsx').name).strip(' .')
     return clean if clean.lower().endswith('.xlsx') else (clean or 'input') + '.xlsx'
@@ -301,9 +329,17 @@ def handle_job(job: dict[str, Any], server: Server, bot_dirs: dict[str, Path], c
         args += ['--store', store]
     port = _debug_port(bot_dir)
     cancel_every = max(2, int(cfg.get('CANCEL_CHECK_EVERY') or DEFAULT_CANCEL_CHECK_EVERY))
+    # Each bot logs to <script>.log. Remember where this run starts so only its lines are reported.
+    bot_log = script.with_suffix('.log')
+    log_start = _log_size(bot_log)
+    # Crashes before logging starts (missing Chrome, missing package) only reach stderr, so keep it.
+    err_path = excel.parent / 'bot_errors.txt'
     started = time.time()
     log(f'  running {script} ...')
-    proc = subprocess.Popen(args, cwd=str(script.parent), creationflags=subprocess.CREATE_NEW_CONSOLE)
+    with err_path.open('w', encoding='utf-8') as err_file:
+        proc = subprocess.Popen(
+            args, cwd=str(script.parent), creationflags=subprocess.CREATE_NEW_CONSOLE, stderr=err_file,
+        )
 
     try:
         next_check = time.time() + cancel_every
@@ -328,6 +364,10 @@ def handle_job(job: dict[str, Any], server: Server, bot_dirs: dict[str, Path], c
     note = EXIT_NOTES.get(code, f'Bot exited with code {code}.')
     if done is None and remaining is None:
         note += ' The bot wrote no result files.'
+    if code != 0:
+        detail = bot_error_text(bot_log, log_start, err_path)
+        if detail:
+            note += '\nBot output:\n' + detail
     log(f'  bot exited with code {code}. done={done} remaining={remaining}')
     server.upload_results(vendor, job_id, done, remaining, code, note)
     server.complete(vendor, job_id, 'done' if (done or remaining) else 'failed', note)
