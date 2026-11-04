@@ -1,0 +1,4 @@
+ingest.env
+ingest.log
+jobs/
+__pycache__/
